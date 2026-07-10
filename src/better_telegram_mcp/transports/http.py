@@ -117,13 +117,16 @@ def start_http(settings: Settings) -> None:
       fallback would serve a shared ``default.session`` + ``TELEGRAM_PHONE``
       across every visitor, which leaks credentials (the 2026-04-21
       incident). Refuse to start rather than silently ship that behaviour.
+      Override with ``TELEGRAM_ACCEPT_SHARED_SINGLE_USER=1`` iff you really
+      do own every request (e.g. a private CF Tunnel behind basic auth).
     """
     if _is_multi_user_mode(settings):
         _start_multi_user_http(settings)
         return
 
     public_url = os.environ.get("PUBLIC_URL")
-    if public_url:
+    override = os.environ.get("TELEGRAM_ACCEPT_SHARED_SINGLE_USER") == "1"
+    if public_url and not override:
         missing = []
         if not _dcr_secret():
             missing.append("MCP_DCR_SERVER_SECRET (legacy DCR_SERVER_SECRET)")
@@ -134,8 +137,10 @@ def start_http(settings: Settings) -> None:
             "but multi-user mode requires "
             f"{', '.join(missing)} to be set as well. Without them the server "
             "falls back to a SHARED default.session + TELEGRAM_PHONE across "
-            "every visitor, which leaks credentials. Please provide the "
-            "missing values to enable per-user OAuth 2.1."
+            "every visitor, which leaks credentials. Either provide the "
+            "missing values to enable per-user OAuth 2.1, or set "
+            "TELEGRAM_ACCEPT_SHARED_SINGLE_USER=1 to explicitly opt in to "
+            "single-user behaviour (only safe on private networks)."
         )
         raise RuntimeError(msg)
 
