@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1216,3 +1218,262 @@ async def test_run_http():
         assert args[0] is mcp
         assert kwargs["server_name"] == "better-telegram-mcp"
         assert kwargs["port"] == 8080
+
+
+# --- lifespan: one shared backend across overlapping transports ---
+#
+# Each MCP transport session runs its own _lifespan. Every one of them used to
+# build a fresh Telethon client against the same on-disk session file, so a
+# second concurrent client hit "database is locked", and the first lifespan to
+# exit disconnected whichever backend the *newest* lifespan had stored in the
+# module global. These tests pin the refcounted-singleton contract instead.
+
+
+class _CountingBackendFactory:
+    """Stand-in for UserBackend that records how many clients were built."""
+
+    def __init__(
+        self, connect_delay: float = 0.0, connect_error: Exception | None = None
+    ):
+        self.instances: list[AsyncMock] = []
+        self._connect_delay = connect_delay
+        self._connect_error = connect_error
+
+    def __call__(self, *args, **kwargs):
+        backend = AsyncMock()
+        backend.is_authorized = AsyncMock(return_value=True)
+
+        async def _connect():
+            if self._connect_delay:
+                await asyncio.sleep(self._connect_delay)
+            if self._connect_error is not None:
+                raise self._connect_error
+
+        backend.connect = AsyncMock(side_effect=_connect)
+        self.instances.append(backend)
+        return backend
+
+
+def _configured_user_settings():
+    settings = MagicMock()
+    settings.is_configured = True
+    settings.mode = "user"
+    settings.api_id = 12345
+    settings.api_hash = "testhash"
+    settings.phone = "+84912345678"
+    return settings
+
+
+@contextlib.contextmanager
+def _patched_lifespan_backend(factory):
+    """Patch Settings + UserBackend and reset the shared-backend state."""
+    import better_telegram_mcp.server as srv
+
+    old_backend = srv._backend
+    old_refs = getattr(srv, "_backend_refs", 0)
+    srv._backend = None
+    if hasattr(srv, "_backend_refs"):
+        srv._backend_refs = 0
+    try:
+        with (
+            patch.object(srv, "Settings", return_value=_configured_user_settings()),
+            patch.dict(
+                "sys.modules",
+                {
+                    "better_telegram_mcp.backends.user_backend": type(
+                        "module", (), {"UserBackend": factory}
+                    )()
+                },
+            ),
+        ):
+            yield srv
+    finally:
+        srv._backend = old_backend
+        if hasattr(srv, "_backend_refs"):
+            srv._backend_refs = old_refs
+
+
+@pytest.mark.asyncio
+async def test_overlapping_lifespans_share_one_backend():
+    """Two overlapping transports must share a single connected backend, and
+    only the last one out may disconnect it."""
+    from better_telegram_mcp.server import _lifespan
+
+    factory = _CountingBackendFactory()
+    with _patched_lifespan_backend(factory) as srv:
+        async with _lifespan(mcp):
+            async with _lifespan(mcp):
+                assert len(factory.instances) == 1, (
+                    "second transport built its own Telethon client against the "
+                    "same session file"
+                )
+                assert srv._backend is factory.instances[0]
+            # inner transport closed; the outer one is still using the backend
+            factory.instances[0].disconnect.assert_not_awaited()
+
+        factory.instances[0].connect.assert_awaited_once()
+        factory.instances[0].disconnect.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_lifespan_starts_build_one_backend():
+    """Two transports arriving at once must not race into two clients."""
+    from better_telegram_mcp.server import _lifespan
+
+    factory = _CountingBackendFactory(connect_delay=0.05)
+    with _patched_lifespan_backend(factory):
+
+        async def _hold():
+            async with _lifespan(mcp):
+                await asyncio.sleep(0.05)
+
+        await asyncio.gather(_hold(), _hold())
+
+        assert len(factory.instances) == 1, (
+            f"{len(factory.instances)} clients built for 2 concurrent transports"
+        )
+        factory.instances[0].disconnect.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_sequential_lifespans_reconnect():
+    """Once the last transport leaves, the next one must connect afresh rather
+    than hand out the disconnected backend."""
+    from better_telegram_mcp.server import _lifespan
+
+    factory = _CountingBackendFactory()
+    with _patched_lifespan_backend(factory) as srv:
+        async with _lifespan(mcp):
+            pass
+        async with _lifespan(mcp):
+            assert len(factory.instances) == 2
+            assert srv._backend is factory.instances[1]
+
+        for backend in factory.instances:
+            backend.connect.assert_awaited_once()
+            backend.disconnect.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_failed_connect_does_not_wedge_later_transports():
+    """A connect() that raises must leave no reference behind, so the next
+    transport still tries to connect instead of reusing a dead backend."""
+    from better_telegram_mcp.server import _lifespan
+
+    factory = _CountingBackendFactory(connect_error=RuntimeError("boom"))
+    with _patched_lifespan_backend(factory) as srv:
+        with pytest.raises(RuntimeError, match="boom"):
+            async with _lifespan(mcp):
+                pass
+        assert srv._backend is None, "a backend that never connected was published"
+        assert srv._backend_refs == 0
+
+        factory._connect_error = None
+        async with _lifespan(mcp):
+            assert len(factory.instances) == 2
+            assert srv._backend is factory.instances[1]
+            factory.instances[1].connect.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_teardown_does_not_strand_a_reference():
+    """An HTTP client hanging up cancels the transport mid-teardown. That must
+    not leave a reference behind pinning the backend open for every later
+    transport."""
+    from better_telegram_mcp.server import _lifespan
+
+    factory = _CountingBackendFactory()
+    with _patched_lifespan_backend(factory) as srv:
+        started = asyncio.Event()
+
+        async def _transport():
+            async with _lifespan(mcp):
+                started.set()
+                await asyncio.sleep(3600)
+
+        task = asyncio.create_task(_transport())
+        await started.wait()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        assert srv._backend_refs == 0, "cancelled transport kept its reference"
+        assert srv._backend is None
+
+        # A later transport must still get a working connection.
+        async with _lifespan(mcp):
+            assert len(factory.instances) == 2
+            assert srv._backend is factory.instances[1]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_teardown_under_lock_contention_does_not_strand():
+    """The teardown of an unconfigured transport can land while a newly
+    configured one holds the backend lock through connect(). Cancelling it
+    there must still drop its reference — otherwise the refcount never returns
+    to zero and the backend is pinned open for the life of the process."""
+    import better_telegram_mcp.server as srv
+    from better_telegram_mcp.server import _lifespan
+
+    factory = _CountingBackendFactory(connect_delay=0.2)
+    configured = _configured_user_settings()
+    unconfigured = MagicMock()
+    unconfigured.is_configured = False
+    unconfigured.mode = "user"
+    settings = [unconfigured, configured]
+
+    old_backend, old_refs = srv._backend, srv._backend_refs
+    srv._backend, srv._backend_refs = None, 0
+    try:
+        with (
+            patch.object(srv, "Settings", side_effect=lambda: settings.pop(0)),
+            patch.dict(
+                "sys.modules",
+                {
+                    "better_telegram_mcp.backends.user_backend": type(
+                        "module", (), {"UserBackend": factory}
+                    )()
+                },
+            ),
+        ):
+            unconfigured_cm = _lifespan(mcp)
+            await unconfigured_cm.__aenter__()  # refs 1, no backend yet
+
+            # Configured transport grabs the lock and holds it through connect.
+            connecting = asyncio.create_task(_lifespan(mcp).__aenter__())
+            await asyncio.sleep(0.05)
+
+            # Unconfigured transport tears down while the lock is held, and is
+            # cancelled before it can get in.
+            leaving = asyncio.create_task(unconfigured_cm.__aexit__(None, None, None))
+            await asyncio.sleep(0)
+            leaving.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await leaving
+            await connecting
+
+            assert srv._backend_refs == 1, (
+                f"refs={srv._backend_refs}: the cancelled transport did not "
+                "release its hold"
+            )
+    finally:
+        srv._backend, srv._backend_refs = old_backend, old_refs
+
+
+@pytest.mark.asyncio
+async def test_hot_reload_replacement_is_disconnected_at_zero_refs():
+    """A hot-reload can swap the published backend while a transport holds the
+    old one. The last transport out must close both, or the replacement keeps
+    the session file open forever."""
+    from better_telegram_mcp.server import _lifespan
+
+    factory = _CountingBackendFactory()
+    with _patched_lifespan_backend(factory) as srv:
+        async with _lifespan(mcp):
+            held = srv._backend
+            replacement = factory()  # stands in for _reinit_backend_from_relay
+            srv._backend = replacement
+
+        held.disconnect.assert_awaited_once()
+        replacement.disconnect.assert_awaited_once()
+        assert srv._backend is None

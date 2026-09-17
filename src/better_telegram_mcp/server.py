@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import functools
 import logging
 import os
@@ -27,6 +28,13 @@ from .utils.formatting import err, ok
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 _backend: TelegramBackend | None = None
+# Number of live lifespans holding ``_backend``. Every MCP transport session
+# runs its own ``_lifespan``, but they all share one on-disk Telethon session
+# file, which takes a single writer. Build one client for the first transport
+# and hand it to the rest; disconnect when the last one leaves.
+_backend_refs: int = 0
+_backend_lock: asyncio.Lock | None = None
+_backend_lock_loop: asyncio.AbstractEventLoop | None = None
 _settings: Settings | None = None
 _pending_auth: bool = False
 _unconfigured: bool = False
@@ -38,6 +46,22 @@ _runtime_config: dict[str, int] = {
 # Track whether we're in multi-user HTTP mode
 _multi_user_mode: bool = False
 _get_current_backend = None
+
+
+def _acquire_lock() -> asyncio.Lock:
+    """Serialize backend connect/disconnect within the running loop.
+
+    Rebound when the loop changes: a lock is bound to the loop that first
+    awaits it, and the process runs a fresh ``asyncio.run`` per transport
+    mode (and per test). A dead loop can hold no waiters, so rebinding is
+    safe.
+    """
+    global _backend_lock, _backend_lock_loop
+    loop = asyncio.get_running_loop()
+    if _backend_lock is None or _backend_lock_loop is not loop:
+        _backend_lock = asyncio.Lock()
+        _backend_lock_loop = loop
+    return _backend_lock
 
 
 def get_backend() -> TelegramBackend:
@@ -144,8 +168,9 @@ def _register_hot_reload() -> None:
         if not _settings.is_configured:
             return
         logger.info("Hot-reloading backend from relay config ({})", _settings.mode)
-        _backend = _create_backend_instance(_settings)
-        await _backend.connect()
+        backend = _create_backend_instance(_settings)
+        await backend.connect()
+        _backend = backend
         _unconfigured = False
         _pending_auth = False
         logger.info("Backend hot-reloaded successfully ({})", _settings.mode)
@@ -153,9 +178,36 @@ def _register_hot_reload() -> None:
     set_on_configured(_reinit_backend_from_relay)
 
 
+async def _release_backend(owned: TelegramBackend | None) -> None:
+    """Drop this lifespan's hold; the last one out disconnects.
+
+    The bookkeeping runs before any ``await`` so a transport cancelled during
+    teardown — the normal path when an HTTP client hangs up — cannot strand its
+    reference and pin the backend open forever.
+    """
+    global _backend, _backend_refs, _unconfigured
+    _backend_refs = max(0, _backend_refs - 1)
+    if _backend_refs:
+        return
+    _unconfigured = False
+    # Close both the instance this lifespan connected and whatever is published
+    # now: a hot-reload may have replaced the global while we held it, and at
+    # zero refs nothing needs either.
+    stale: list[TelegramBackend] = []
+    for backend in (owned, _backend):
+        if backend is not None and all(backend is not s for s in stale):
+            stale.append(backend)
+    _backend = None
+    async with _acquire_lock():
+        for backend in stale:
+            await backend.disconnect()
+    if stale:
+        logger.info("Disconnected from Telegram")
+
+
 @asynccontextmanager
 async def _lifespan(server: FastMCP) -> AsyncIterator[None]:
-    global _backend, _settings, _pending_auth, _unconfigured
+    global _backend, _backend_refs, _settings, _pending_auth, _unconfigured
     _settings = _ensure_settings()
 
     if not _settings.is_configured:
@@ -178,34 +230,41 @@ async def _lifespan(server: FastMCP) -> AsyncIterator[None]:
 
         _register_hot_reload()
 
+        async with _acquire_lock():
+            _backend_refs += 1
         try:
             yield
         finally:
-            _unconfigured = False
-            # Disconnect backend if it was created via hot-reload
-            if _backend is not None:
-                await _backend.disconnect()
-                logger.info("Disconnected from Telegram")
+            # A hot-reload may have built a backend while we were unconfigured;
+            # the last transport out disconnects it.
+            await _release_backend(None)
         return
 
     logger.info("Mode: {}", _settings.mode)
-    _backend = _create_backend_instance(_settings)
-    await _backend.connect()
-    logger.info("Connected to Telegram ({})", _settings.mode)
-
-    if _settings.mode == "user" and not await _backend.is_authorized():
-        _pending_auth = True
-        logger.warning(
-            "Session not authorized. "
-            "Remove credential env vars and restart to trigger relay setup "
-            "(relay handles OTP/2FA via bidirectional messaging)."
-        )
+    async with _acquire_lock():
+        if _backend_refs and _backend is not None:
+            owned = _backend
+            logger.info("Reusing Telegram backend ({} transports)", _backend_refs + 1)
+        else:
+            owned = _create_backend_instance(_settings)
+            # Publish only once connected, so a failed connect leaves nothing
+            # behind for the next transport to reuse.
+            await owned.connect()
+            _backend = owned
+            logger.info("Connected to Telegram ({})", _settings.mode)
+        _backend_refs += 1
 
     try:
+        if _settings.mode == "user" and not await owned.is_authorized():
+            _pending_auth = True
+            logger.warning(
+                "Session not authorized. "
+                "Remove credential env vars and restart to trigger relay setup "
+                "(relay handles OTP/2FA via bidirectional messaging)."
+            )
         yield
     finally:
-        await _backend.disconnect()
-        logger.info("Disconnected from Telegram")
+        await _release_backend(owned)
 
 
 mcp = FastMCP(
